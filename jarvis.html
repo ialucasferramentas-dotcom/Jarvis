@@ -211,6 +211,11 @@
       <option value="claude-3-opus-latest">claude-3-opus-latest</option>
       <option value="claude-3-5-sonnet-20241022">claude-3-5-sonnet-20241022</option>
     </select>
+    <label for="sel-voice" style="margin-left:.5rem;">🔊 VOZ</label>
+    <select id="sel-voice" style="background:var(--bg3);border:1px solid var(--brd);color:var(--c);font-family:var(--mono);font-size:.7rem;padding:.35rem .5rem;outline:none;max-width:160px;">
+      <option value="">AUTOMATICA</option>
+    </select>
+    <span id="fish-status" style="margin-left:.5rem;">🐟 VOZ CLONADA ATIVA</span>
     <button id="btn-api">SALVAR</button>
     <button id="btn-test" style="font-family:var(--mono);font-size:.68rem;color:#2dd4ff;background:transparent;border:1px solid #2dd4ff;padding:.38rem .7rem;cursor:pointer;">TESTAR</button>
     <button id="btn-scan" style="font-family:var(--mono);font-size:.68rem;color:#fbbf24;background:transparent;border:1px solid #fbbf24;padding:.38rem .7rem;cursor:pointer;">🔍 VARRER MODELOS</button>
@@ -307,6 +312,20 @@ var CONFIG = {
   model:       'claude-sonnet-5'
 };
 
+// frases curtas de confirmacao, ditas na hora em que o comando e reconhecido,
+// enquanto a resposta real ainda esta sendo processada — da a sensacao de um
+// assistente que reage na hora, tipo o Jarvis do filme
+var ACK_PHRASES = [
+  'Sim, ' + CONFIG.address + '.',
+  'Pois nao, ' + CONFIG.address + '.',
+  'Entendido, ' + CONFIG.address + '.',
+  'Ja providenciando.',
+  'Certo, ja vou verificar.',
+  'Um momento, por favor.',
+  'Compreendido.',
+  'Deixe comigo.'
+];
+
 var AREA = {
   meta:        { label: 'Pessoal',     color: '#8a90a6' },
   metas:       { label: 'Metas',       color: '#fbbf24' },
@@ -398,34 +417,159 @@ window.addEventListener('DOMContentLoaded', function() {
 function loadVoices() {
   var vs = speechSynthesis.getVoices();
   if (!vs.length) return;
+
+  // popula o seletor manual (uma vez só, quando a lista muda de tamanho)
+  var sel = document.getElementById('sel-voice');
+  var ptVoices = vs.filter(function(v){ return v.lang.indexOf('pt')===0; });
+  if (sel && sel.options.length - 1 !== ptVoices.length) {
+    var savedVoiceName = localStorage.getItem('jarvis_voice_name') || '';
+    sel.innerHTML = '<option value="">AUTOMATICA</option>';
+    ptVoices.forEach(function(v){
+      var opt = document.createElement('option');
+      opt.value = v.name;
+      opt.textContent = v.name + ' (' + v.lang + ')';
+      if (v.name === savedVoiceName) opt.selected = true;
+      sel.appendChild(opt);
+    });
+    sel.onchange = function(){
+      localStorage.setItem('jarvis_voice_name', sel.value);
+      loadVoices();
+    };
+  }
+
+  var savedVoiceName = localStorage.getItem('jarvis_voice_name') || '';
+  if (savedVoiceName) {
+    selVoice = vs.find(function(v){ return v.name === savedVoiceName; });
+    if (selVoice) return;
+  }
+
   var ptBR = vs.filter(function(v){ return v.lang==='pt-BR'||v.lang==='pt_BR'; });
   var ptAny = vs.filter(function(v){ return v.lang.indexOf('pt')===0; });
+  // nomes de vozes masculinas graves usadas por diferentes plataformas (iOS/Android/Chrome)
+  var maleNames = /daniel|edgard|felipe|ricardo|jorge|thiago|antonio|carlos|male|homem|masculin/i;
+  var femaleNames = /luciana|francisca|female|mulher|feminin|maria|ana(?!drea)/i;
   if (CONFIG.voiceGender === 'male') {
-    selVoice = ptBR.find(function(v){ return /daniel|edgard|lucas|male/i.test(v.name); }) ||
-               ptBR.find(function(v){ return !/luciana|francisca|female/i.test(v.name); }) ||
-               ptBR[0] || ptAny[0];
+    selVoice = ptBR.find(function(v){ return maleNames.test(v.name); }) ||
+               ptAny.find(function(v){ return maleNames.test(v.name); }) ||
+               ptBR.find(function(v){ return !femaleNames.test(v.name); }) ||
+               ptBR[0] || ptAny[0] || null;
   } else {
-    selVoice = ptBR.find(function(v){ return /luciana|francisca/i.test(v.name); }) || ptBR[0] || ptAny[0];
+    selVoice = ptBR.find(function(v){ return femaleNames.test(v.name); }) || ptBR[0] || ptAny[0] || null;
   }
-  if (!selVoice && vs.length) selVoice = vs[0];
+  // nunca cai para outro idioma automaticamente — se nao achou nenhuma voz em pt, fica sem voz definida
+  // (o navegador ainda assim vai falar em pt-BR, so que com a voz padrao do sistema)
+}
+
+var currentFishAudio = null;
+
+var FISH_PROXY_URL = 'https://jarvis-fish-proxy.ialucasferramentas.workers.dev';
+
+function stopFishAudio() {
+  if (currentFishAudio) {
+    try { currentFishAudio.pause(); } catch(e) {}
+    currentFishAudio = null;
+  }
+}
+
+// Chama o Worker do Cloudflare, que por sua vez chama o Fish Audio (a chave
+// e o ID da voz ficam guardados com seguranca dentro do Worker, nao aqui).
+// Retorna uma URL de audio (blob) ou null se o proxy nao estiver configurado.
+async function fishTTS(text) {
+  if (!FISH_PROXY_URL) return null;
+  var res = await fetch(FISH_PROXY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: text })
+  });
+  if (!res.ok) {
+    var errTxt = await res.text().catch(function(){ return ''; });
+    throw new Error('Proxy HTTP ' + res.status + (errTxt ? ' — ' + errTxt : ''));
+  }
+  var blob = await res.blob();
+  return URL.createObjectURL(blob);
 }
 
 function speak(text) {
-  speechSynthesis.cancel();
-  var u = new SpeechSynthesisUtterance(text);
-  u.lang  = 'pt-BR';
-  u.rate  = 0.93;
-  u.pitch = CONFIG.voiceGender==='male' ? 0.88 : 1.1;
-  if (selVoice) u.voice = selVoice;
+  stopFishAudio();
   busy = true;
   orbState('s-speak');
   setStatus('FALANDO...', false);
-  u.onend = u.onerror = function() {
-    busy = false; orbState('');
-    setStatus('AGUARDANDO — diga "' + CONFIG.name + '"', true);
-    safeStart();
-  };
-  speechSynthesis.speak(u);
+  fishTTS(text).then(function(url){
+    if (!url) { speakBrowser(text); return; }
+    var audio = new Audio(url);
+    currentFishAudio = audio;
+    audio.onended = audio.onerror = function() {
+      URL.revokeObjectURL(url);
+      if (currentFishAudio === audio) currentFishAudio = null;
+      busy = false; orbState('');
+      setStatus('AGUARDANDO — diga "' + CONFIG.name + '"', true);
+      safeStart();
+    };
+    audio.play().catch(function(){ speakBrowser(text); });
+  }).catch(function(e){
+    console.warn('Fish Audio falhou, usando voz do navegador:', e.message);
+    speakBrowser(text);
+  });
+}
+
+// Fallback: sintetizador de voz do proprio navegador (usado se o Fish Audio
+// nao estiver configurado ou a chamada falhar — ex: CORS, sem credito, etc.)
+function speakBrowser(text) {
+  speechSynthesis.cancel();
+  busy = true;
+  orbState('s-speak');
+  setStatus('FALANDO...', false);
+
+  var partes = text.match(/[^.!?]+[.!?]+|[^.!?]+$/g) || [text];
+  partes = partes.map(function(p){ return p.trim(); }).filter(Boolean);
+
+  var i = 0;
+  function falarProxima() {
+    if (i >= partes.length) {
+      busy = false; orbState('');
+      setStatus('AGUARDANDO — diga "' + CONFIG.name + '"', true);
+      safeStart();
+      return;
+    }
+    var u = new SpeechSynthesisUtterance(partes[i]);
+    u.lang = 'pt-BR';
+    var jitterRate  = (Math.random()*0.08) - 0.04;
+    var jitterPitch = (Math.random()*0.06) - 0.03;
+    u.rate  = (CONFIG.voiceGender==='male' ? 0.97 : 1.0) + jitterRate;
+    u.pitch = (CONFIG.voiceGender==='male' ? 0.85 : 1.05) + jitterPitch;
+    if (selVoice) u.voice = selVoice;
+    i++;
+    u.onend = u.onerror = function() { setTimeout(falarProxima, 130); };
+    speechSynthesis.speak(u);
+  }
+  falarProxima();
+}
+
+function quickAck() {
+  stopFishAudio();
+  var frase = ACK_PHRASES[Math.floor(Math.random()*ACK_PHRASES.length)];
+  fishTTS(frase).then(function(url){
+    if (!url) { quickAckBrowser(frase); return; }
+    var audio = new Audio(url);
+    currentFishAudio = audio;
+    audio.onended = audio.onerror = function() {
+      URL.revokeObjectURL(url);
+      if (currentFishAudio === audio) currentFishAudio = null;
+    };
+    audio.play().catch(function(){ quickAckBrowser(frase); });
+  }).catch(function(){ quickAckBrowser(frase); });
+}
+
+function quickAckBrowser(frase) {
+  try {
+    speechSynthesis.cancel();
+    var u = new SpeechSynthesisUtterance(frase);
+    u.lang  = 'pt-BR';
+    u.rate  = 1.0;
+    u.pitch = CONFIG.voiceGender==='male' ? 0.85 : 1.05;
+    if (selVoice) u.voice = selVoice;
+    speechSynthesis.speak(u);
+  } catch(e) {}
 }
 
 // STT
@@ -643,6 +787,7 @@ async function processCmd(text) {
     setUserLn('(chave formato inválido)'); setResp(m); speak(m); return;
   }
   busy = true; orbState('s-think'); setUserLn(text); setStatus('PROCESSANDO...', false);
+  quickAck();
   convHist.push({ role: 'user', content: text });
 
   var modelsToTry = [
