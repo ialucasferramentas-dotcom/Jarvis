@@ -823,8 +823,15 @@ async function processCmd(text) {
 
       if (res.ok) {
         var data = await res.json();
-        var reply = (data && data.content && data.content[0] && data.content[0].text) ? data.content[0].text : '';
-        if (!reply) reply = 'Nao recebi resposta valida. Tente novamente, ' + CONFIG.address + '.';
+        var reply = '';
+        if (data && Array.isArray(data.content)) {
+          var textBlock = data.content.find(function(b){ return b.type === 'text' && b.text; });
+          if (textBlock) reply = textBlock.text;
+        }
+        if (!reply) {
+          console.warn('Resposta sem bloco de texto valido:', JSON.stringify(data));
+          reply = 'Nao recebi resposta valida. Tente novamente, ' + CONFIG.address + '.';
+        }
         reply = handleSaves(reply);
         convHist.push({ role: 'assistant', content: reply });
         setResp(reply);
